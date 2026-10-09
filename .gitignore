@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+venv/
+.env
+agent.log
+data/report_*.json
