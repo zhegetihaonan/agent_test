@@ -85,14 +85,14 @@ def load_daily_info():
     """
     daily_info.txt 推荐格式：
 
-    2026-10-07,1200000,96.2%
-    2026-10-08,1100000,93.5%
+    2026-10-07,720000,12.6%
+    2026-10-08,810000,13.1%
 
     也支持：
-    2026-10-07 1200000 96.2%
-    2026-10-08 1100000 0.935
+    2026-10-07 720000 12.6%
+    2026-10-08 810000 0.131
 
-    返回最近 3 条有效记录。
+    返回最近 7 条有效记录。
     """
     path = Path(DAILY_INFO_FILE)
     if not path.exists():
@@ -132,7 +132,7 @@ def load_daily_info():
             continue
 
     rows.sort(key=lambda x: x["date"])
-    return rows[-3:]
+    return rows[-7:]
 
 
 def get_docker_logs():
@@ -227,9 +227,22 @@ def build_snapshot():
 
     history = load_daily_info()
     logs = get_docker_logs()
+    rule_findings = []
 
     for q in task_queues:
         q["over_threshold"] = q["messages"] > THRESHOLD
+        if q["consumers"] == 0 and q["messages"] > 0:
+            rule_findings.append({"queue": q["name"], "level": "ALERT", "reason": "队列有积压但消费者数为 0"})
+        elif q["over_threshold"]:
+            rule_findings.append({"queue": q["name"], "level": "REVIEW", "reason": f"积压超过参考阈值 {THRESHOLD:,}"})
+
+    if len(history) < 2:
+        data_status = "历史数据不足，无法判断趋势"
+    else:
+        data_status = f"已读取 {len(history)} 条历史记录"
+
+    if logs["abnormal_line_count"]:
+        rule_findings.append({"queue": None, "level": "REVIEW", "reason": f"近 {DOCKER_LOG_HOURS} 小时日志命中异常关键词 {logs['abnormal_line_count']} 行"})
 
     return {
         "generated_at": datetime.now().astimezone().isoformat(),
@@ -239,6 +252,8 @@ def build_snapshot():
         "daily_history": history,
         "trends": calculate_trends(history),
         "docker_logs": logs,
+        "data_status": data_status,
+        "rule_findings": rule_findings,
     }
 
 
@@ -246,7 +261,7 @@ SYSTEM_PROMPT = """
 你是一个 RabbitMQ 爬虫系统运维巡检 Agent。
 
 当前阶段是观察期，绝对禁止执行 purge，也没有 purge 工具。
-你的任务是根据当前队列、过去三天任务量/检测率、任务趋势以及 RabbitMQ
+你的任务是根据当前队列、过去七天任务量/检测率、任务趋势以及 RabbitMQ
 容器最近日志，对每个 task 队列给出巡检建议。
 
 请重点考虑：
@@ -255,10 +270,11 @@ SYSTEM_PROMPT = """
 3. 如果任务量连续上升、检测率稳定/上升，同时队列积压增加，可能只是正常流量增长，不应仅因超过阈值就建议清理。
 4. 如果检测率明显下降，同时队列持续增长，优先提高告警等级。
 5. 如果日志出现大量 timeout/error/failed/exception，优先考虑系统消费能力或依赖异常。
-6. 当前只有最多三天历史数据，因此不要把趋势说成确定因果关系。
-7. 数据不足时明确说“数据不足”，不要编造。
-8. 不要仅仅因为超过 50 万就机械地给出 PURGE。
-9. 这是生产系统巡检，宁可 ALERT，也不要在证据不足时给出过度确定的结论。
+6. 代码提供的 rule_findings 是明确规则命中，必须纳入判断；规则命中不等于自动清队列。
+7. 当前最多只有七条历史数据，因此不要把趋势说成确定因果关系。
+8. 数据不足时明确说“数据不足”，不要编造。
+9. 不要仅仅因为超过阈值就机械地给出 PURGE_RECOMMEND；当前始终是观察模式。
+10. 这是生产系统巡检，宁可 ALERT，也不要在证据不足时给出过度确定的结论。
 
 对每个 task 队列返回：
 - queue
@@ -298,11 +314,45 @@ def call_llm(snapshot):
     text = re.sub(r"\s*```$", "", text)
 
     try:
-        return json.loads(text)
+        decision = json.loads(text)
     except json.JSONDecodeError as exc:
         raise RuntimeError(
             f"模型没有返回合法 JSON:\n{text}"
         ) from exc
+
+    validate_decision(snapshot, decision)
+    return decision
+
+
+def validate_decision(snapshot, decision):
+    """拒绝结构不完整或引用未知队列的模型结果。"""
+    if not isinstance(decision, dict) or not isinstance(decision.get("queues"), list):
+        raise RuntimeError("模型结果格式错误：queues 必须是数组")
+    if not isinstance(decision.get("overall_summary"), str):
+        raise RuntimeError("模型结果格式错误：缺少 overall_summary")
+
+    expected = {q["name"] for q in snapshot["task_queues"]}
+    found = set()
+    allowed = {"PURGE_RECOMMEND", "KEEP", "ALERT"}
+    for item in decision["queues"]:
+        if not isinstance(item, dict) or item.get("queue") not in expected:
+            raise RuntimeError("模型结果包含格式错误或未知队列")
+        name = item["queue"]
+        if name in found:
+            raise RuntimeError(f"模型结果重复队列: {name}")
+        found.add(name)
+        if item.get("decision") not in allowed:
+            raise RuntimeError(f"模型结果 decision 无效: {name}")
+        confidence = item.get("confidence")
+        if not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+            raise RuntimeError(f"模型结果 confidence 必须在 0 到 1 之间: {name}")
+        if not all(isinstance(item.get(key), str) for key in ("reason", "next_action")):
+            raise RuntimeError(f"模型结果缺少 reason 或 next_action: {name}")
+        if not isinstance(item.get("evidence"), list):
+            raise RuntimeError(f"模型结果 evidence 必须是数组: {name}")
+
+    if found != expected:
+        raise RuntimeError(f"模型结果队列不完整，缺少: {', '.join(sorted(expected - found))}")
 
 
 def build_wecom_markdown(snapshot, decision):
@@ -317,7 +367,7 @@ def build_wecom_markdown(snapshot, decision):
     trends = snapshot["trends"]
     if trends["history_days"]:
         lines.extend([
-            "### 过去三天趋势",
+            "### 过去七天趋势",
             f"- 任务量趋势：{trends['task_trend']}"
             + (
                 f"（{trends['task_change_pct']}%）"
@@ -337,7 +387,10 @@ def build_wecom_markdown(snapshot, decision):
             "",
         ])
 
-    lines.append("### 队列情况")
+    lines.append("### 数据采集")
+    lines.append(f"- {snapshot.get('data_status', '未知')}")
+    lines.append(f"- RabbitMQ 日志：{snapshot['docker_logs']['total_log_lines']} 行，关键词命中 {snapshot['docker_logs']['abnormal_line_count']} 行")
+    lines.extend(["", "### 队列情况"])
 
     result_items = decision.get("queues", [])
     by_name = {x.get("queue"): x for x in result_items}
@@ -349,12 +402,15 @@ def build_wecom_markdown(snapshot, decision):
         confidence = item.get("confidence", "-")
         lines.append(
             f"- **{name}**：{q['messages']:,} 条，"
+            f"消费者 {q['consumers'] if q['consumers'] is not None else '未知'}，"
             f"建议 `{decision_name}`，置信度 `{confidence}`"
         )
         if item.get("reason"):
             lines.append(f"  - 原因：{item['reason']}")
         if item.get("next_action"):
             lines.append(f"  - 建议：{item['next_action']}")
+        if item.get("evidence"):
+            lines.append("  - 证据：" + "；".join(str(x) for x in item["evidence"][:5]))
 
     summary = decision.get("overall_summary")
     if summary:
