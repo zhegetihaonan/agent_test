@@ -3,12 +3,12 @@ import logging
 import os
 import re
 import subprocess
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
 from openai import OpenAI
-
 
 THRESHOLD = int(os.getenv("QUEUE_THRESHOLD", "500000"))
 QUEUE_PATTERN = os.getenv("QUEUE_PATTERN", "task")
@@ -22,6 +22,7 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-luna")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "").strip()
 
 WECOM_WEBHOOK = os.getenv("WECOM_WEBHOOK", "")
+WECOM_MAX_ATTEMPTS = 3
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -38,6 +39,7 @@ def run_command(cmd, timeout=30):
         capture_output=True,
         text=True,
         timeout=timeout,
+        check=False,
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -298,7 +300,7 @@ def call_llm(snapshot):
     if OPENAI_BASE_URL:
         client_kwargs["base_url"] = OPENAI_BASE_URL
 
-    client = OpenAI(**client_kwargs)
+    client = OpenAI(**client_kwargs, timeout=45.0, max_retries=2)
 
     response = client.responses.create(
         model=OPENAI_MODEL,
@@ -436,50 +438,92 @@ def send_wecom(content):
         },
     }
 
-    response = requests.post(
-        WECOM_WEBHOOK,
-        json=payload,
-        timeout=15,
-    )
-    response.raise_for_status()
+    for attempt in range(1, WECOM_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                WECOM_WEBHOOK,
+                json=payload,
+                timeout=15,
+            )
+            response.raise_for_status()
 
-    result = response.json()
-    if result.get("errcode") != 0:
-        raise RuntimeError(f"企微发送失败: {result}")
+            result = response.json()
+            if result.get("errcode") != 0:
+                raise RuntimeError(f"企微发送失败: {result}")
+            return
+        except (requests.RequestException, RuntimeError) as exc:
+            if attempt == WECOM_MAX_ATTEMPTS:
+                raise
+            delay = 2 ** (attempt - 1)
+            logger.warning(
+                "企微发送失败（%d/%d），%d 秒后重试：%s",
+                attempt,
+                WECOM_MAX_ATTEMPTS,
+                delay,
+                type(exc).__name__,
+            )
+            time.sleep(delay)
+
+
+def build_failure_report(stage, error):
+    detail = str(error).replace(WECOM_WEBHOOK, "[webhook已隐藏]")
+    if OPENAI_API_KEY:
+        detail = detail.replace(OPENAI_API_KEY, "[API Key已隐藏]")
+    detail = re.sub(r"https?://\S+", "[链接已隐藏]", detail)[:500]
+    return "\n".join([
+        "## RabbitMQ Agent 巡检失败",
+        f"> 时间：{datetime.now().astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        f"> 失败阶段：{stage}",
+        f"> 错误类型：{type(error).__name__}",
+        f"> 错误摘要：{detail or '无详细错误信息'}",
+        "",
+        "本次巡检未能完整完成，请检查运行日志和依赖服务。",
+    ])
 
 
 def main():
     logger.info("开始 RabbitMQ Agent 巡检")
+    stage = "采集队列与日志数据"
+    try:
+        snapshot = build_snapshot()
 
-    snapshot = build_snapshot()
+        logger.info(
+            "发现 %d 个 task 队列，历史数据 %d 天",
+            len(snapshot["task_queues"]),
+            len(snapshot["daily_history"]),
+        )
 
-    logger.info(
-        "发现 %d 个 task 队列，历史数据 %d 天",
-        len(snapshot["task_queues"]),
-        len(snapshot["daily_history"]),
-    )
+        stage = "调用模型分析"
+        decision = call_llm(snapshot)
 
-    decision = call_llm(snapshot)
+        stage = "保存巡检报告"
+        Path("data").mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        Path(f"data/report_{ts}.json").write_text(
+            json.dumps(
+                {
+                    "snapshot": snapshot,
+                    "decision": decision,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-    # 本地保存一份原始巡检结果，方便回溯 Agent 为什么这么判断
-    Path("data").mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    Path(f"data/report_{ts}.json").write_text(
-        json.dumps(
-            {
-                "snapshot": snapshot,
-                "decision": decision,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+        report = build_wecom_markdown(snapshot, decision)
+        stage = "发送巡检报告"
+        send_wecom(report)
 
-    report = build_wecom_markdown(snapshot, decision)
-    send_wecom(report)
-
-    print(report)
+        print(report)
+    except Exception as exc:
+        logger.exception("巡检在“%s”阶段失败", stage)
+        if WECOM_WEBHOOK:
+            try:
+                send_wecom(build_failure_report(stage, exc))
+            except Exception:
+                logger.exception("发送巡检失败告警也失败")
+        raise
 
 
 if __name__ == "__main__":
