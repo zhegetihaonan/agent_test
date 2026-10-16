@@ -139,13 +139,32 @@ def load_daily_info():
 
 def get_docker_logs():
     """
-    获取 RabbitMQ 容器最近 N 小时日志，并做关键词摘要。
+    获取 RabbitMQ 容器最近 N 小时日志，合并 stdout/stderr 并做关键词摘要。
     """
     since = f"{DOCKER_LOG_HOURS}h"
-    output = run_command(
-        ["docker", "logs", "--since", since, CONTAINER_NAME],
-        timeout=60,
-    )
+    cmd = ["docker", "logs", "--since", since, CONTAINER_NAME]
+    logger.info("执行: %s", " ".join(cmd))
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("Docker 日志采集失败: %s", type(exc).__name__)
+        return unavailable_docker_logs(f"{type(exc).__name__}: {exc}")
+
+    output = result.stdout or ""
+    if result.returncode != 0:
+        detail = output.strip()[-500:] or "命令未返回错误详情"
+        logger.warning("Docker 日志采集失败，退出码 %s", result.returncode)
+        return unavailable_docker_logs(
+            f"docker logs 退出码 {result.returncode}: {detail}",
+            exit_code=result.returncode,
+        )
 
     lines = output.splitlines()
     keywords = ("error", "exception", "timeout", "failed", "warning", "warn")
@@ -173,10 +192,26 @@ def get_docker_logs():
 
     return {
         "hours": DOCKER_LOG_HOURS,
+        "available": True,
+        "exit_code": result.returncode,
+        "error": None,
         "total_log_lines": len(lines),
         "abnormal_line_count": len(abnormal),
         "keyword_counts": counts,
         "abnormal_samples": text,
+    }
+
+
+def unavailable_docker_logs(error, exit_code=None):
+    return {
+        "hours": DOCKER_LOG_HOURS,
+        "available": False,
+        "exit_code": exit_code,
+        "error": str(error)[:500],
+        "total_log_lines": None,
+        "abnormal_line_count": None,
+        "keyword_counts": {},
+        "abnormal_samples": "",
     }
 
 
@@ -185,6 +220,8 @@ def calculate_trends(history):
         return {
             "history_days": len(history),
             "task_change_pct": None,
+            "task_change_absolute": None,
+            "task_change_note": "历史记录不足，无法判断任务量趋势",
             "detect_rate_change_points": None,
             "detect_rate_change_pct": None,
             "task_trend": "insufficient_data",
@@ -194,16 +231,29 @@ def calculate_trends(history):
     first = history[0]
     last = history[-1]
 
-    task_change = None
-    if first["tasks"] != 0:
-        task_change = (last["tasks"] - first["tasks"]) / first["tasks"] * 100
+    task_change_absolute = last["tasks"] - first["tasks"]
+    if first["tasks"] == 0:
+        task_change = None
+        if last["tasks"] == 0:
+            task_trend = "no_tasks"
+            task_change_note = "连续无任务；零基线不适用百分比变化"
+        else:
+            task_trend = "started_from_zero"
+            task_change_note = "从零开始产生任务；零基线无法计算百分比变化"
+    else:
+        task_change = task_change_absolute / first["tasks"] * 100
+        task_trend = (
+            "rising" if task_change > 5
+            else "falling" if task_change < -5
+            else "stable"
+        )
+        task_change_note = None
 
     rate_change = last["detect_rate"] - first["detect_rate"]
     rate_change_pct = None
     if first["detect_rate"] != 0:
         rate_change_pct = rate_change / first["detect_rate"] * 100
 
-    task_trend = "rising" if task_change > 5 else "falling" if task_change < -5 else "stable"
     rate_trend = (
         "rising" if rate_change > 1
         else "falling" if rate_change < -1
@@ -213,6 +263,8 @@ def calculate_trends(history):
     return {
         "history_days": len(history),
         "task_change_pct": round(task_change, 2) if task_change is not None else None,
+        "task_change_absolute": task_change_absolute,
+        "task_change_note": task_change_note,
         "detect_rate_change_points": round(rate_change, 4),
         "detect_rate_change_pct": round(rate_change_pct, 2) if rate_change_pct is not None else None,
         "task_trend": task_trend,
@@ -243,7 +295,13 @@ def build_snapshot():
     else:
         data_status = f"已读取 {len(history)} 条历史记录"
 
-    if logs["abnormal_line_count"]:
+    if not logs["available"]:
+        rule_findings.append({
+            "queue": None,
+            "level": "ALERT",
+            "reason": "RabbitMQ 容器日志不可用，无法判断日志异常",
+        })
+    elif logs["abnormal_line_count"]:
         rule_findings.append({"queue": None, "level": "REVIEW", "reason": f"近 {DOCKER_LOG_HOURS} 小时日志命中异常关键词 {logs['abnormal_line_count']} 行"})
 
     return {
@@ -272,11 +330,13 @@ SYSTEM_PROMPT = """
 3. 如果任务量连续上升、检测率稳定/上升，同时队列积压增加，可能只是正常流量增长，不应仅因超过阈值就建议清理。
 4. 如果检测率明显下降，同时队列持续增长，优先提高告警等级。
 5. 如果日志出现大量 timeout/error/failed/exception，优先考虑系统消费能力或依赖异常。
-6. 代码提供的 rule_findings 是明确规则命中，必须纳入判断；规则命中不等于自动清队列。
-7. 当前最多只有七条历史数据，因此不要把趋势说成确定因果关系。
-8. 数据不足时明确说“数据不足”，不要编造。
-9. 不要仅仅因为超过阈值就机械地给出 PURGE_RECOMMEND；当前始终是观察模式。
-10. 这是生产系统巡检，宁可 ALERT，也不要在证据不足时给出过度确定的结论。
+6. task_trend 为 no_tasks 时表示首尾均无任务；为 started_from_zero 时表示任务从零开始出现。零基线时不要编造百分比变化，应结合 task_change_absolute 描述。
+7. docker_logs.available 为 false 时，日志证据不可用，不得当作“没有异常”；应明确提醒关注日志采集失败。
+8. 代码提供的 rule_findings 是明确规则命中，必须纳入判断；规则命中不等于自动清队列。
+9. 当前最多只有七条历史数据，因此不要把趋势说成确定因果关系。
+10. 数据不足时明确说“数据不足”，不要编造。
+11. 不要仅仅因为超过阈值就机械地给出 PURGE_RECOMMEND；当前始终是观察模式。
+12. 这是生产系统巡检，宁可 ALERT，也不要在证据不足时给出过度确定的结论。
 
 对每个 task 队列返回：
 - queue
@@ -370,11 +430,7 @@ def build_wecom_markdown(snapshot, decision):
     if trends["history_days"]:
         lines.extend([
             "### 过去七天趋势",
-            f"- 任务量趋势：{trends['task_trend']}"
-            + (
-                f"（{trends['task_change_pct']}%）"
-                if trends["task_change_pct"] is not None else ""
-            ),
+            f"- 任务量趋势：{format_task_trend(trends)}",
             f"- 检测率趋势：{trends['detect_rate_trend']}"
             + (
                 f"（{trends['detect_rate_change_points']} 个百分点）"
@@ -391,7 +447,22 @@ def build_wecom_markdown(snapshot, decision):
 
     lines.append("### 数据采集")
     lines.append(f"- {snapshot.get('data_status', '未知')}")
-    lines.append(f"- RabbitMQ 日志：{snapshot['docker_logs']['total_log_lines']} 行，关键词命中 {snapshot['docker_logs']['abnormal_line_count']} 行")
+    logs = snapshot["docker_logs"]
+    if logs["available"]:
+        lines.append(
+            f"- RabbitMQ 日志：{logs['total_log_lines']} 行，"
+            f"关键词命中 {logs['abnormal_line_count']} 行"
+        )
+    else:
+        lines.append(f"- RabbitMQ 日志不可用：{logs.get('error') or '未提供错误详情'}")
+    findings = snapshot.get("rule_findings", [])
+    if findings:
+        lines.extend(["", "### 规则提醒"])
+        for finding in findings:
+            scope = f"[{finding['queue']}] " if finding.get("queue") else ""
+            lines.append(
+                f"- {finding['level']}：{scope}{finding['reason']}"
+            )
     lines.extend(["", "### 队列情况"])
 
     result_items = decision.get("queues", [])
@@ -424,6 +495,28 @@ def build_wecom_markdown(snapshot, decision):
     ])
 
     return "\n".join(lines)
+
+
+def format_task_trend(trends):
+    labels = {
+        "rising": "上升",
+        "falling": "下降",
+        "stable": "稳定",
+        "no_tasks": "持续无任务",
+        "started_from_zero": "从零开始产生任务",
+        "insufficient_data": "数据不足",
+    }
+    label = labels.get(trends["task_trend"], trends["task_trend"])
+    change_pct = trends.get("task_change_pct")
+    if change_pct is not None:
+        label += f"（{change_pct}%）"
+    absolute = trends.get("task_change_absolute")
+    if absolute is not None:
+        label += f"，绝对变化 {absolute:+,} 条"
+    note = trends.get("task_change_note")
+    if note:
+        label += f"；{note}"
+    return label
 
 
 def send_wecom(content):

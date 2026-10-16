@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,87 @@ class AgentChecks(unittest.TestCase):
 
         self.assertEqual(post.call_count, 2)
         sleep.assert_called_once_with(1)
+
+    def test_zero_baseline_trends_are_explicit(self):
+        no_tasks = main.calculate_trends([
+            {"tasks": 0, "detect_rate": 0},
+            {"tasks": 0, "detect_rate": 0},
+        ])
+        started = main.calculate_trends([
+            {"tasks": 0, "detect_rate": 0},
+            {"tasks": 100, "detect_rate": 10},
+        ])
+
+        self.assertEqual(no_tasks["task_trend"], "no_tasks")
+        self.assertEqual(no_tasks["task_change_pct"], None)
+        self.assertEqual(no_tasks["task_change_absolute"], 0)
+        self.assertEqual(started["task_trend"], "started_from_zero")
+        self.assertEqual(started["task_change_pct"], None)
+        self.assertEqual(started["task_change_absolute"], 100)
+        self.assertIn("从零开始产生任务", main.format_task_trend(started))
+        self.assertNotIn("%", main.format_task_trend(started))
+
+    def test_positive_baseline_can_fall_to_zero(self):
+        trend = main.calculate_trends([
+            {"tasks": 100, "detect_rate": 10},
+            {"tasks": 0, "detect_rate": 8},
+        ])
+
+        self.assertEqual(trend["task_trend"], "falling")
+        self.assertEqual(trend["task_change_pct"], -100)
+        self.assertEqual(trend["task_change_absolute"], -100)
+
+    def test_single_history_row_is_insufficient(self):
+        trend = main.calculate_trends([{"tasks": 0, "detect_rate": 0}])
+
+        self.assertEqual(trend["task_trend"], "insufficient_data")
+        self.assertIsNone(trend["task_change_pct"])
+        self.assertIsNone(trend["task_change_absolute"])
+
+    def test_docker_logs_merge_streams_and_mark_failures_unavailable(self):
+        outputs = (
+            "stdout line\nERROR stdout",
+            "ERROR stderr",
+            "stdout warning\nERROR stderr",
+        )
+        for output in outputs:
+            with self.subTest(output=output):
+                result = Mock(returncode=0, stdout=output)
+                with patch.object(main.subprocess, "run", return_value=result) as run:
+                    logs = main.get_docker_logs()
+
+                self.assertTrue(logs["available"])
+                self.assertGreaterEqual(logs["abnormal_line_count"], 1)
+                self.assertEqual(run.call_args.kwargs["stderr"], subprocess.STDOUT)
+
+        failed = Mock(returncode=1, stdout="docker daemon unavailable")
+        with patch.object(main.subprocess, "run", return_value=failed):
+            logs = main.get_docker_logs()
+
+        self.assertFalse(logs["available"])
+        self.assertEqual(logs["exit_code"], 1)
+        self.assertIsNone(logs["abnormal_line_count"])
+        self.assertIn("daemon unavailable", logs["error"])
+
+    def test_unavailable_logs_are_reported_as_alert(self):
+        with (
+            patch.object(main, "list_queues", return_value=[]),
+            patch.object(main, "load_daily_info", return_value=[]),
+            patch.object(
+                main,
+                "get_docker_logs",
+                return_value=main.unavailable_docker_logs("docker logs failed", 1),
+            ),
+        ):
+            snapshot = main.build_snapshot()
+
+        report = main.build_wecom_markdown(
+            snapshot,
+            {"queues": [], "overall_summary": "日志不可用，无法判断"},
+        )
+        self.assertTrue(any(item["level"] == "ALERT" for item in snapshot["rule_findings"]))
+        self.assertIn("RabbitMQ 容器日志不可用", report)
+        self.assertIn("ALERT", report)
 
 
 if __name__ == "__main__":
