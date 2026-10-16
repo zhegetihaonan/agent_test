@@ -2,6 +2,8 @@
 
 一个用于个人业务巡检的轻量 Agent：汇总 RabbitMQ task 队列、最近 7 天任务量与检出率、容器日志，由代码规则和 LLM 共同形成关注建议，并可发送到企业微信。
 
+代码按职责拆分在 `rabbitmq_agent/`：`collectors` 采集数据，`analysis` 计算趋势并组装快照，`decision` 调用和校验模型，`reporting` 生成报告与通知，`app` 串起巡检流程。根目录 `main.py` 保留为启动入口。
+
 当前是观察模式，只提供建议，不执行 `purge_queue`。
 
 ## 运行

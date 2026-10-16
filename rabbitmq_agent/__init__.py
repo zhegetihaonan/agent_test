@@ -1,0 +1,1 @@
+"""RabbitMQ inspection agent modules."""
